@@ -1,0 +1,168 @@
+-- counts the number of rows per user_crm_id (especially for duplicate rows)
+WITH row_check AS (
+  SELECT *,
+  ROW_NUMBER() OVER (PARTITION BY user_crm_id ORDER BY latest_login_date DESC) row_num
+  FROM `warehouse.users`
+),
+
+-- returns only unique user_crm_id with most recent latest_login_date
+cleaned_data AS (
+  SELECT * except(row_num) FROM row_check
+  WHERE row_num=1 AND user_crm_id IS NOT NULL
+),
+
+-- group cities by regions of England and other countries in the British Isles
+UK_region AS (
+  SELECT user_crm_id, user_gender,
+  CASE WHEN city IN ("Aberdeen","Dundee","Glasgow", "Edinburgh", "Livingston") THEN "Scotland"
+  WHEN city IN ("Cardiff","Swansea") THEN "Wales"
+  WHEN city IN ("Ashburn","Frankfurt","City - Other") THEN "Other"
+  WHEN city IN ("Dublin","Belfast") THEN "Ireland"
+  WHEN city IN ("Brighton", "Brentford", "Crawley", "Maidstone", "Reading", "Oxford", "Slough", "Milton Keynes","Cheltenham") THEN "South-East England"
+  WHEN city IN ("Colchester", "Ipswich", "Norwich", "Southend-on-Sea", "Watford", "Luton", "Cambridge", "Peterborough", "Chelmsford") THEN "East of England"
+  WHEN city IN ("Portsmouth", "Basingstoke", "Bournemouth", "Bristol", "Exeter", "Poole", "Southampton") THEN "South-West England"
+  WHEN city IN ("Nottingham", "Derby", "Newcastle upon Tyne", "Northampton", "Leicester", "Lincoln", "Loughborough", "Stoke-on-Trent", "Telford", "Walsall", "Coventry", "Chesterfield") THEN "Midlands"
+  WHEN city IN ("Kingston upon Hull", "Chesterfield", "Barnsley", "Birkenhead",  "Bradford", "Doncaster", "Stockton-on-Tees", "York", "Huddersfield", "Sunderland") THEN "North-East England & Yorkshire"
+  WHEN city IN ("Liverpool", "Blackpool", "Hudderfield", "Preston", "Stockport", "Rochdale", "Lancaster", "Bolton", "Blackburn") THEN "North-West England"
+  WHEN city = "Croydon" THEN "Croydon"
+  WHEN city = "London" THEN "London"
+  WHEN city = "Leeds" THEN "Leeds"
+  WHEN city = "Manchester" THEN "Manchester"
+  WHEN city = "Plymouth" THEN "Plymouth"
+  WHEN city = "Sheffield" THEN "Sheffield"
+  WHEN city = "Birmingham" THEN "Birmingham"
+ELSE "Other" END AS region
+  -- region grouping selected for convenience of viewing multiple towns and cities to identify any patterns with customer behaviour and especially RFM 
+  -- high customer population cities (generally p>25000) treated as independent from region to minimise bias and focusing on high-priority cities
+  -- cities include London, Leeds, Birmingham, Croydon, Manchester, Plymouth, Sheffield
+  -- high customer population cities have unique CASE lines as all other cities not included in total list will be sent to 'Other' category
+  -- reason being to account for sudden appearance of new named cities in the complete database which may not have been added to the list
+FROM cleaned_data
+WHERE city IS NOT NULL
+),
+
+-- Transaction Table used for collecting data
+-- recency, Frequency and Monetary are calculated for RFM queries
+-- Data is grouped by user_crm_id to get a total for each value from each user
+
+CustomerRFM AS (
+    SELECT
+        user_crm_id,
+        CASE WHEN latest_purchase_date IS NULL THEN latest_login_date 
+        --code to account for non-purchasers much later on, as even if they not bought anything they may have logged in to view particular features/products/etc.
+        ELSE latest_purchase_date END AS Recency,
+        transaction_count AS Frequency,
+        total_revenue AS Monetary,
+        uk.user_gender AS gender, 
+        uk.region AS region
+    FROM
+        cleaned_data
+    LEFT JOIN uk_region AS uk
+        USING(user_crm_id)
+),
+
+RFM_Scores AS (
+    SELECT
+        user_crm_id,
+        gender,
+        region,
+        Recency,
+        Frequency,
+        Monetary,
+        -- Scoring based on recency
+        -- Splits
+                -- 4 = within 6 months
+                -- 3 = within 1 year
+                -- 2 = within 1.5 years
+                -- 1 = over 1.5 years
+        CASE
+            WHEN Recency >= DATE_SUB(DATE('2022-04-01'), INTERVAL 180 DAY) THEN 4
+            WHEN Recency >= DATE_SUB(DATE('2022-04-01'), INTERVAL 360 DAY) THEN 3
+            WHEN Recency >= DATE_SUB(DATE('2022-04-01'), INTERVAL 540 DAY) THEN 2
+            ELSE 1
+        END AS R_Score,
+        -- count per score
+        -- 4 = 86427
+        -- 3 = 43623
+        -- 2 = 29496
+        -- 1 = 62313
+        -- Scoring based on Frequency
+        -- Splits
+                -- 4 = 15 or more orders
+                -- 3 = 3-4 or more orders
+                -- 2 = 2 or more orders
+                -- 1 = 1 order
+        CASE
+            WHEN Frequency >= 5 THEN 4
+            WHEN Frequency >= 3 THEN 3
+            WHEN Frequency = 2 THEN 2
+            ELSE 1
+        END AS F_Score,
+        -- count per split
+        -- 4 = 4588
+        -- 3 = 13483
+        -- 2 = 32000
+        -- 1 = 176971
+        -- Scoring based on Revenue
+        -- Splits
+                -- 4 = over £200 spent
+                -- 3 = over £100 spent
+                -- 2 = over £50 spent
+                -- 1 = under £50 spent
+        CASE
+            WHEN Monetary >= 200 THEN 5
+            WHEN Monetary >= 100 THEN 4
+            WHEN Monetary >= 50 THEN 3
+            WHEN Monetary >= 1 THEN 2
+            ELSE 1
+        END AS M_Score
+        -- count per split
+        -- 4 = 2663
+        -- 3 = 9789
+        -- 2 = 32750
+        -- 1 = 177204
+    FROM
+        CustomerRFM
+    -- Filtering for only registered users
+),
+
+customer_score AS (
+    SELECT
+        *,
+    --combining all scores to create a RFM score
+    --CONCAT(CAST(R_Score AS STRING), CAST(F_Score AS STRING), CAST(M_Score AS STRING)) AS RFM_Code,
+    --Segmenting customers based on RFM score - into 4 categories
+    CASE
+        WHEN R_Score = 4 AND F_Score >= 3 AND M_Score >= 4 THEN 'Best Customers'
+        WHEN R_Score >= 2 AND F_Score >= 3 AND M_Score >= 2 THEN 'Loyal Customers'
+        WHEN R_Score = 4 AND F_Score = 1 AND M_Score <= 2 THEN 'Recent Customers'
+        --WHEN R_Score >=2 AND F_Score <= 1 AND M_Score >= 3 THEN 'Bulk buying Customers'
+        --WHEN R_Score = 1 AND F_Score <= 2 AND M_Score >= 2 THEN 'Churned Customers'
+        --WHEN R_Score <= 3 AND F_Score >= 2 AND M_Score >= 2 THEN 'Fading Customers'        
+        WHEN M_Score = 1 THEN 'non-purchase'
+        ELSE 'Other'
+    END AS Customer_Segment
+FROM
+    RFM_Scores
+)
+
+SELECT
+    region,
+    gender,
+    R_Score,
+    F_Score,
+    M_Score,
+    DATE_TRUNC(Recency,year) AS year,
+    -- CASE WHEN Recency IS NOT NULL THEN DATE_TRUNC(Recency,year)
+    -- ELSE "2020-01-01" END AS year, --2020-01-01 is a placeholder to ensure data consistency for null values in field
+    SUM(Frequency) AS Frequency,
+--    ROUND(AVG(Frequency),2) AS Avg_Frequency,
+    ROUND(SUM(Monetary),2) AS Monetary,
+--    ROUND(AVG(Monetary),2) AS Avg_Monetary,
+    -- Originally intended to add Recency, Frequency, Monetary fields. But doing so while grouping all fields together in order to make the aggregate feature work breaks the counting, so they have been ommitted in this code.
+    Customer_Segment,
+    COUNT(DISTINCT user_crm_id) AS customer_count
+FROM customer_score
+--GROUP BY 1,2,3,4,5,6,11 --Only add in including both Avg_Frequency and Avg_Monetary
+GROUP BY 1,2,3,4,5,6,9
+ORDER BY region, gender, R_Score DESC, F_Score DESC, M_Score DESC;
